@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+
+set -e
+
+install_dir=PREFIX
+version=1.11.1.1347
+
+function join { local d=$1; shift; echo -n "$1"; shift; printf "%s" "${@/#/$d}"; }
+
+# Extract opts
+print_classpath=false
+describe=false
+verbose=false
+trace=false
+force=false
+repro=false
+tree=false
+pom=false
+help=false
+prep=false
+jvm_opts=()
+repl_aliases=()
+mode="repl"
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    -version)
+      >&2 echo "Clojure CLI version $version"
+      exit 0
+      ;;
+    --version)
+      echo "Clojure CLI version $version"
+      exit 0
+      ;;
+    -J*)
+      jvm_opts+=("${1:2}")
+      shift
+      ;;
+    -R*)
+      >&2 echo "-R is no longer supported, use -A with repl, -M for main, -X for exec, -T for tool"
+      exit 1
+      ;;
+    -C*)
+      >&2 echo "-C is no longer supported, use -A with repl, -M for main, -X for exec, -T for tool"
+      exit 1
+      ;;
+    -O*)
+      >&2 echo "-O is no longer supported, use -A with repl, -M for main, -X for exec, -T for tool"
+      exit 1
+      ;;
+    -A)
+      >&2 echo "-A requires an alias"
+      exit 1
+      ;;
+    -A*)
+      repl_aliases+=("${1:2}")
+      shift
+      ;;
+    -M)
+      mode="main"
+      shift
+      break
+      ;;
+    -M*)
+      mode="main"
+      main_aliases="${1:2}"
+      shift
+      break
+      ;;
+    -X)
+      mode="exec"
+      shift
+      break
+      ;;
+    -X*)
+      mode="exec"
+      exec_aliases="${1:2}"
+      shift
+      break
+      ;;
+    -T:*)
+      mode="tool"
+      tool_aliases="${1:2}"
+      shift
+      break
+      ;;
+    -T*)
+      mode="tool"
+      tool_name="${1:2}"
+      shift
+      break
+      ;;
+    -T)
+      mode="tool"
+      shift
+      break
+      ;;
+    -P)
+      prep=true
+      shift
+      ;;
+    -Sdeps)
+      shift
+      deps_data="${1}"
+      shift
+      ;;
+    -Scp)
+      shift
+      force_cp="${1}"
+      shift
+      ;;
+    -Spath)
+      print_classpath=true
+      shift
+      ;;
+    -Sverbose)
+      verbose=true
+      shift
+      ;;
+    -Sthreads)
+      shift
+      threads="${1}"
+      shift
+      ;;
+    -Strace)
+      trace=true
+      shift
+      ;;
+    -Sdescribe)
+      describe=true
+      shift
+      ;;
+    -Sforce)
+      force=true
+      shift
+      ;;
+    -Srepro)
+      repro=true
+      shift
+      ;;
+    -Stree)
+      tree=true
+      shift
+      ;;
+    -Spom)
+      pom=true
+      shift
+      ;;
+    -Sresolve-tags)
+      >&2 echo "Option changed, use: clj -X:deps git-resolve-tags"
+      exit 1
+      ;;
+    -S*)
+      >&2 echo "Invalid option: $1"
+      exit 1
+      ;;
+    -h|--help|"-?")
+      if [[ -n "$main_aliases" ]] || [[ ${#repl_aliases[@]} -gt 0 ]]; then
+        break
+      else
+        help=true
+        shift
+      fi
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# Find java executable
+set +e
+JAVA_CMD=${JAVA_CMD:-$(type -p java)}
+set -e
+if [[ -z "$JAVA_CMD" ]]; then
+  if [[ -n "$JAVA_HOME" ]] && [[ -x "$JAVA_HOME/bin/java" ]]; then
+    JAVA_CMD="$JAVA_HOME/bin/java"
+  else
+    >&2 echo "Couldn't find 'java'. Please set JAVA_HOME."
+    exit 1
+  fi
+fi
+
+if "$help"; then
+  cat <<-END
+	Version: $version
+
+	You use the Clojure tools ('clj' or 'clojure') to run Clojure programs
+	on the JVM, e.g. to start a REPL or invoke a specific function with data.
+	The Clojure tools will configure the JVM process by defining a classpath
+	(of desired libraries), an execution environment (JVM options) and
+	specifying a main class and args.
+
+	Using a deps.edn file (or files), you tell Clojure where your source code
+	resides and what libraries you need. Clojure will then calculate the full
+	set of required libraries and a classpath, caching expensive parts of this
+	process for better performance.
+
+	The internal steps of the Clojure tools, as well as the Clojure functions
+	you intend to run, are parameterized by data structures, often maps. Shell
+	command lines are not optimized for passing nested data, so instead you
+	will put the data structures in your deps.edn file and refer to them on the
+	command line via 'aliases' - keywords that name data structures.
+
+	'clj' and 'clojure' differ in that 'clj' has extra support for use as a REPL
+	in a terminal, and should be preferred unless you don't want that support,
+	then use 'clojure'.
+
+	Usage:
+	  Start a REPL  clj     [clj-opt*] [-Aaliases]
+	  Exec fn(s)    clojure [clj-opt*] -X[aliases] a/fn? [kpath v]* kv-map?
+	  Run tool      clojure [clj-opt*] -T[name|aliases] a/fn [kpath v] kv-map?
+	  Run main      clojure [clj-opt*] -M[aliases] [init-opt*] [main-opt] [arg*]
+	  Prepare       clojure [clj-opt*] -P [other exec opts]
+
+	exec-opts:
+	 -Aaliases      Use concatenated aliases to modify classpath
+	 -X[aliases]    Use concatenated aliases to modify classpath or supply exec fn/args
+	 -T[toolname|aliases]  Invoke tool by name or via aliases ala -X
+	 -M[aliases]    Use concatenated aliases to modify classpath or supply main opts
+	 -P             Prepare deps - download libs, cache classpath, but don't exec
+
+	clj-opts:
+	 -Jopt          Pass opt through in java_opts, ex: -J-Xmx512m
+	 -Sdeps EDN     Deps data to use as the last deps file to be merged
+	 -Spath         Compute classpath and echo to stdout only
+	 -Stree         Print dependency tree
+	 -Scp CP        Do NOT compute or cache classpath, use this one instead
+	 -Srepro        Ignore the ~/.clojure/deps.edn config file
+	 -Sforce        Force recomputation of the classpath (don't use the cache)
+	 -Sverbose      Print important path info to console
+	 -Sdescribe     Print environment and command parsing info as data
+	 -Sthreads      Set specific number of download threads
+	 -Strace        Write a trace.edn file that traces deps expansion
+	 --             Stop parsing dep options and pass remaining arguments to clojure.main
+	 --version      Print the version to stdout and exit
+	 -version       Print the version to stderr and exit
+
+	init-opt:
+	 -i, --init path     Load a file or resource
+	 -e, --eval string   Eval exprs in string; print non-nil values
+	 --report target     Report uncaught exception to "file" (default), "stderr", or "none"
+
+	main-opt:
+	 -m, --main ns-name  Call the -main function from namespace w/args
+	 -r, --repl          Run a repl
+	 path                Run a script from a file or resource
+	 -                   Run a script from standard input
+	 -h, -?, --help      Print this help message and exit
+
+	Programs provided by :deps alias:
+	 -X:deps list              List full transitive deps set and licenses
+	 -X:deps tree              Print deps tree
+	 -X:deps find-versions     Find available versions of a library
+	 -X:deps prep              Prepare all unprepped libs in the dep tree
+	 -X:deps mvn-pom           Generate (or update) pom.xml with deps and paths
+	 -X:deps mvn-install       Install a maven jar to the local repository cache
+	 -X:deps git-resolve-tags  Resolve git coord tags to shas and update deps.edn
+
+	For more info, see:
+	 https://clojure.org/guides/deps_and_cli
+	 https://clojure.org/reference/repl_and_main
+END
+  exit 0
+fi
+
+# Set tools classpath used for the various programs before the user's program
+tools_cp="$install_dir/libexec/clojure-tools-$version.jar"
+
+# Determine user config directory
+if [[ -n "$CLJ_CONFIG" ]]; then
+  config_dir="$CLJ_CONFIG"
+elif [[ -n "$XDG_CONFIG_HOME" ]]; then
+  config_dir="$XDG_CONFIG_HOME/clojure"
+else
+  config_dir="$HOME/.clojure"
+fi
+
+# If user config directory does not exist, create it
+if [[ ! -d "$config_dir" ]]; then
+  mkdir -p "$config_dir"
+fi
+if [[ ! -e "$config_dir/deps.edn" ]]; then
+  cp "$install_dir/example-deps.edn" "$config_dir/deps.edn"
+fi
+if [ "$install_dir/tools.edn" -nt "$config_dir/tools/tools.edn" ]; then
+  mkdir -p "$config_dir/tools"
+  cp "$install_dir/tools.edn" "$config_dir/tools/tools.edn"
+fi
+
+# Determine user cache directory
+if [[ -n "$CLJ_CACHE" ]]; then
+  user_cache_dir="$CLJ_CACHE"
+elif [[ -n "$XDG_CACHE_HOME" ]]; then
+  user_cache_dir="$XDG_CACHE_HOME/clojure"
+else
+  user_cache_dir="$config_dir/.cpcache"
+fi
+
+# Chain deps.edn in config paths. repro=skip config dir
+config_project="deps.edn"
+if "$repro"; then
+  config_paths=("$install_dir/deps.edn" "deps.edn")
+else
+  config_user="$config_dir/deps.edn"
+  config_paths=("$install_dir/deps.edn" "$config_dir/deps.edn" "deps.edn")
+fi
+
+# Determine whether to use user or project cache
+if [[ -f deps.edn ]]; then
+  cache_dir=.cpcache
+else
+  cache_dir="$user_cache_dir"
+fi
+
+# Construct location of cached classpath file
+cache_version=4
+val="$cache_version|$(join '' ${repl_aliases[@]})|$exec_aliases|$main_aliases|$deps_data|$tool_name|$tool_aliases"
+for config_path in "${config_paths[@]}"; do
+  if [[ -f "$config_path" ]]; then
+    val="$val|$config_path"
+  else
+    val="$val|NIL"
+  fi
+done
+ck=$(echo "$val" | cksum | cut -d" " -f 1)
+
+cp_file="$cache_dir/$ck.cp"
+jvm_file="$cache_dir/$ck.jvm"
+main_file="$cache_dir/$ck.main"
+basis_file="$cache_dir/$ck.basis"
+manifest_file="$cache_dir/$ck.manifest"
+
+# Print paths in verbose mode
+if "$verbose"; then
+  echo "version      = $version"
+  echo "install_dir  = $install_dir"
+  echo "config_dir   = $config_dir"
+  echo "config_paths =" "${config_paths[@]}"
+  echo "cache_dir    = $cache_dir"
+  echo "cp_file      = $cp_file"
+  echo
+fi
+
+# Check for stale classpath file
+stale=false
+if "$force" || "$trace" || "$tree" || "$prep" || [ ! -f "$cp_file" ]; then
+  stale=true
+elif [[ -n "$tool_name" ]] && [ "$config_dir/tools/$tool_name.edn" -nt "$cp_file" ]; then
+  stale=true
+else
+  # Are deps.edn files stale?
+  for config_path in "${config_paths[@]}"; do
+    if [ "$config_path" -nt "$cp_file" ]; then
+      stale=true
+      break
+    fi
+  done
+
+  # Are .jar files in classpath missing?
+  IFS=':' read -ra cp_entries <<<"$(cat $cp_file)"
+  for cp_entry in "${cp_entries[@]}"; do
+    if [[ "$cp_entry" == *.jar && ! -f "$cp_entry" ]]; then
+      stale=true
+      break
+    fi
+  done
+
+  # Are manifest files in local/git deps stale?
+  if [[ "$stale" = false && -f "$manifest_file" ]]; then
+    set +e
+    IFS=$'\n' read -ra manifest_files -d '' <"$manifest_file"
+    set -e
+    for manifest in "${manifest_files[@]}"; do
+      if [[ ! -f "$manifest" || "$manifest" -nt "$cp_file" ]]; then
+        stale=true
+        break
+      fi
+    done
+  fi
+fi
+
+# Make tools args if needed
+if "$stale" || "$pom"; then
+  tools_args=()
+  if [[ -n "$deps_data" ]]; then
+    tools_args+=("--config-data" "$deps_data")
+  fi
+  if [[ -n "$main_aliases" ]]; then
+    tools_args+=("-M$main_aliases")
+  fi
+  if [[ ${#repl_aliases[@]} -gt 0 ]]; then
+    tools_args+=("-A$(join '' ${repl_aliases[@]})")
+  fi
+  if [[ -n "$exec_aliases" ]]; then
+    tools_args+=("-X$exec_aliases")
+  fi
+  if [ "$mode" == "tool" ]; then
+    tools_args+=("--tool-mode")
+  fi
+  if [[ -n "$tool_name" ]]; then
+    tools_args+=("--tool-name" "$tool_name")
+  fi
+  if [[ -n "$tool_aliases" ]]; then
+    tools_args+=("-T$tool_aliases")
+  fi
+  if [[ -n "$force_cp" ]]; then
+    tools_args+=("--skip-cp")
+  fi
+  if [[ -n "$threads" ]]; then
+    tools_args+=("--threads" "$threads")
+  fi
+  if "$trace"; then
+    tools_args+=("--trace")
+  fi
+  if "$tree"; then
+    tools_args+=("--tree")
+  fi
+fi
+
+# If stale, run make-classpath to refresh cached classpath
+if [[ "$stale" = true && "$describe" = false ]]; then
+  if "$verbose"; then
+    >&2 echo "Refreshing classpath"
+  fi
+  "$JAVA_CMD" -XX:-OmitStackTraceInFastThrow $CLJ_JVM_OPTS -classpath "$tools_cp" clojure.main -m clojure.tools.deps.script.make-classpath2 --config-user "$config_user" --config-project "$config_project" --basis-file "$basis_file" --cp-file "$cp_file" --jvm-file "$jvm_file" --main-file "$main_file" --manifest-file "$manifest_file" "${tools_args[@]}"
+fi
+
+if "$describe"; then
+  cp=
+elif [[ -n "$force_cp" ]]; then
+  cp="$force_cp"
+else
+  cp=$(cat "$cp_file")
+fi
+
+if "$prep"; then
+  exit 0
+elif "$pom"; then
+  exec "$JAVA_CMD" -XX:-OmitStackTraceInFastThrow $CLJ_JVM_OPTS -classpath "$tools_cp" clojure.main -m clojure.tools.deps.script.generate-manifest2 --config-user "$config_user" --config-project "$config_project" --gen=pom "${tools_args[@]}"
+elif "$print_classpath"; then
+  echo "$cp"
+elif "$describe"; then
+  for config_path in "${config_paths[@]}"; do
+    if [[ -f "$config_path" ]]; then
+      path_vector="$path_vector\"$config_path\" "
+    fi
+  done
+  cat <<-END
+	{:version "$version"
+	 :config-files [$path_vector]
+	 :config-user "$config_user"
+	 :config-project "$config_project"
+	 :install-dir "$install_dir"
+	 :config-dir "$config_dir"
+	 :cache-dir "$cache_dir"
+	 :force $force
+	 :repro $repro
+	 :main-aliases "$main_aliases"
+	 :repl-aliases "${repl_aliases[@]}"}
+END
+elif "$tree"; then
+  exit 0
+elif "$trace"; then
+  >&2 echo "Wrote trace.edn"
+else
+  set -f
+  if [[ -f "$jvm_file" ]]; then
+    set +e
+    IFS=$'\n' read -ra jvm_cache_opts -d '' <"$jvm_file"
+    set -e
+  fi
+
+  if [ "$mode" == "tool" ] || [ "$mode" == "exec" ]; then
+    exec "$JAVA_CMD" -XX:-OmitStackTraceInFastThrow $JAVA_OPTS "${jvm_cache_opts[@]}" "${jvm_opts[@]}" "-Dclojure.basis=$basis_file" -classpath "$cp:$install_dir/libexec/exec.jar" clojure.main -m clojure.run.exec "$@"
+  else
+    if [[ -f "$main_file" ]]; then
+      set +e
+      IFS=$'\n' read -ra main_cache_opts -d '' <"$main_file"
+      set -e
+    fi
+    if [ "$#" -gt 0 ] && [ "$mode" == "repl" ]; then
+      >&2 echo "WARNING: Implicit use of clojure.main with options is deprecated, use -M"
+    fi
+    exec "$JAVA_CMD" -XX:-OmitStackTraceInFastThrow $JAVA_OPTS "${jvm_cache_opts[@]}" "${jvm_opts[@]}" "-Dclojure.basis=$basis_file" -classpath "$cp" clojure.main "${main_cache_opts[@]}" "$@"
+  fi
+fi

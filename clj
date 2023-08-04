@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+bin_dir=BINDIR
+
+if type -p rlwrap >/dev/null 2>&1; then
+  exec rlwrap -m -r -q '\"' -b "(){}[],^%#@\";:'" "$bin_dir/clojure" "$@"
+else
+  echo "Please install rlwrap for command editing or use \"clojure\" instead."
+  exit 1
+fi
