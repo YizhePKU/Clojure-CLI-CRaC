@@ -2,7 +2,8 @@
 
 set -e
 
-install_dir=PREFIX
+# Set $install_dir to project root
+install_dir=$( cd "$(dirname "$(dirname "${BASH_SOURCE[0]}")" )" ; pwd -P )
 version=1.11.1.1347
 
 function join { local d=$1; shift; echo -n "$1"; shift; printf "%s" "${@/#/$d}"; }

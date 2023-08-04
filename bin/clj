@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-bin_dir=BINDIR
+bin_dir=$( cd "$(dirname "${BASH_SOURCE[0]}")" ; pwd -P )
 
 if type -p rlwrap >/dev/null 2>&1; then
   exec rlwrap -m -r -q '\"' -b "(){}[],^%#@\";:'" "$bin_dir/clojure" "$@"
